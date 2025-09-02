@@ -1,34 +1,42 @@
 import torch
+from torch import nn
+
 from tokenizer import ChineseTokenizer, EnglishTokenizer
 import config
-from model import TrainslationEncoder, TrainslationDecoder
+from model import TranslationModel
 
 
-def predict_batch(input_tensor, encoder, decoder, zh_tokenizer, en_tokenizer, device):
+def predict_batch(input_tensor, model, zh_tokenizer, en_tokenizer, device):
     """
     批量预测
     :param input_tensor: [batch_size, seq_len]
-    :param encoder:
-    :param decoder:
+    :param model:
     :param zh_tokenizer:
     :param en_tokenizer:
     :param device:
     :return:一批英文句子 e.g.:[[14,212],[2132,21,323,123,122],[213,221,54],...]
     """
-    encoder.eval()
-    decoder.eval()
+    model.eval()
+
     with torch.no_grad():
-        encoder_outputs, context_vector = encoder(input_tensor)  # [batch_size, decoder_hidden_size]
-        batch_size = context_vector.shape[0]
+        # 编码
+        src_pad_mask = (input_tensor==zh_tokenizer.pad_token_id)
+        memory = model.encode(input_tensor,src_pad_mask)  # [batch_size, seq_len, d_model]
+        batch_size = input_tensor.shape[0]
+
+        # 解码
         decoder_input = torch.full((batch_size, 1), en_tokenizer.sos_token_id, device=device)
-        decoder_hidden = context_vector.unsqueeze(0)
+        #[batch_size, 1]
 
         generated = [[] for _ in range(batch_size)]
         is_finished = [False for _ in range(batch_size)]
         for t in range(config.SEQ_LEN):
-            decoder_output, decoder_hidden = decoder(decoder_input, decoder_hidden,encoder_outputs)
-            # decoder_output: [batch_size, 1, vocab_size]
-            predict_indexes = torch.argmax(decoder_output, dim=-1)  # [batch_size, 1]
+            tgt_mask = nn.Transformer.generate_square_subsequent_mask(decoder_input.shape[1]).to(device)
+            tgt_pad_mask = decoder_input==model.tgt_embedding.padding_idx
+            decoder_outputs = model.decode(decoder_input,memory,tgt_mask,src_pad_mask,tgt_pad_mask)
+            # decoder_outputs: [batch_size, tgt_len, vocab_size]
+            last_decoder_output = decoder_outputs[:,-1,:] # [batch_size, 1, vocab_size]
+            predict_indexes = torch.argmax(last_decoder_output, dim=-1)  # [batch_size]
             # 处理每个时间步的预测结果
             for i in range(batch_size):
                 if is_finished[i]:
@@ -42,15 +50,15 @@ def predict_batch(input_tensor, encoder, decoder, zh_tokenizer, en_tokenizer, de
                 if all(is_finished):
                     break
 
-            decoder_input = predict_indexes
+            decoder_input = torch.cat([decoder_input,predict_indexes.unsqueeze(1)],dim=1)
         return generated
 
 
-def predict(user_input, encoder, decoder, zh_tokenizer, en_tokenizer, device):
+def predict(user_input, model, zh_tokenizer, en_tokenizer, device):
     # 处理数据
     index_list = zh_tokenizer.encode(user_input, config.SEQ_LEN)
     input_tensor = torch.tensor([index_list]).to(device)
-    batch_result = predict_batch(input_tensor, encoder, decoder, zh_tokenizer, en_tokenizer, device)
+    batch_result = predict_batch(input_tensor,model, zh_tokenizer, en_tokenizer, device)
     result = batch_result[0]
     return en_tokenizer.decode(result)
     # return result
@@ -63,12 +71,12 @@ def run_predict():
     en_tokenizer = EnglishTokenizer.from_vocab(config.PROCESS_DATA_DIR / 'en_vocab_txt')
 
     # 准备模型
-    encoder = TrainslationEncoder(vocab_size=zh_tokenizer.vocab_size, padding_index=zh_tokenizer.pad_token_id).to(
-        device)
-    decoder = TrainslationDecoder(vocab_size=en_tokenizer.vocab_size, padding_index=en_tokenizer.pad_token_id).to(
-        device)
-    encoder.load_state_dict(torch.load(config.MODELS_DIR / 'encoder.pt'))
-    decoder.load_state_dict(torch.load(config.MODELS_DIR / 'decoder.pt'))
+    model = TranslationModel(zh_vocab_size=zh_tokenizer.vocab_size,
+                             en_vocab_size=en_tokenizer.vocab_size,
+                             zh_padding_idx=zh_tokenizer.pad_token_id,
+                             en_padding_idx=en_tokenizer.pad_token_id).to(device)
+    model.load_state_dict(torch.load(config.MODELS_DIR / 'model.pt'))
+
     print("欢迎使用中英翻译！（输入q或者quit退出）")
     while True:
         user_input = input("中文：")
@@ -78,7 +86,7 @@ def run_predict():
         if user_input.strip() == '':
             print('请输入中文')
             continue
-        result = predict(user_input, encoder, decoder, zh_tokenizer, en_tokenizer, device)
+        result = predict(user_input, model, zh_tokenizer, en_tokenizer, device)
         print(f"英文：{result}")
 
 
